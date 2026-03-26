@@ -97,7 +97,7 @@ The main steps are:
 
 ## Run the code
 
-To execute the full workflow, run:
+To execute the full workflow, run the following command from the project root directory:
 
 ```bash
 python -m src.main
