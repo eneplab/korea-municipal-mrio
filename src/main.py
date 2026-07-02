@@ -1,79 +1,162 @@
 # src/main.py
 
-import pandas as pd
 from pathlib import Path
 import warnings
 
-from metadata.sector import SECTOR_83, SECTOR_76, SECTOR_MAPPING_83_TO_76
-from metadata.region import REGION_HIERARCHY, MUNICIPALITIES_229
-from metadata.account import FINAL_DEMAND_ITEMS
+import pandas as pd
 
-from src.sectoral_aggregation import sectoral_aggregation
-from src.regional_disaggregation import regional_disaggregation
-from src.gravity_parameters import gravity_parameters
-from src.interregional_calibration import gravity_calibration
-from src.multi_regional_balancing import multi_regional_gras
-from src.utils import municipality_name_to_id
-from src.utils import restore_io_labels
-from src.utils import merge_io
-from src.utils import sanitize_for_parquet
+from metadata.account import FINAL_DEMAND_ITEMS
+from metadata.region import MUNICIPALITIES_229, REGION_HIERARCHY
+from metadata.sector import SECTOR_76, SECTOR_83, SECTOR_MAPPING_83_TO_76
+
+from src.intermunicipal_allocation import build_positive_seed, estimate_gravity
+from src.mrio_io import save_mrio
+from src.mrio_preprocessing import mrio_preprocessing
+from src.mrgras_balancing import multi_regional_gras
+from src.municipal_disaggregation import municipal_disaggregation
+from src.utils import build_zero_set, municipality_name_to_id, restore_io_labels, split_signed
+
 
 warnings.filterwarnings("ignore")
 
-SECTOR_NAME_TO_ID_83 = {name: sector_id for sector_id, name in SECTOR_83.items()}
 SECTOR_NAME_TO_ID_76 = {name: sector_id for sector_id, name in SECTOR_76.items()}
 
-def main():
 
-    ROOT = Path(__file__).resolve().parents[1]
-    DATA = ROOT / "data"
-    OUT  = ROOT / "release"
-    OUT.mkdir(exist_ok=True)
+def load_distance(DATA, distance_name):
 
-    ## Load IRIO benchmark table
-    IRIO = pd.read_csv(
-        DATA / "benchmark_io.csv",
+    distance_17 = pd.read_csv(
+        DATA / f"{distance_name}_17.csv",
+        index_col=0,
+    )
+
+    distance_229 = pd.read_csv(
+        DATA / f"{distance_name}_229.csv",
         header=[0, 1],
         index_col=[0, 1],
     )
-    
-    print("[DONE] IRIO benchmark table loaded")
+    distance_229 = municipality_name_to_id(
+        distance_229=distance_229,
+        MUNICIPALITIES_229=MUNICIPALITIES_229,
+    )
 
-    ## Block split
-    Z   = IRIO.iloc[:1411, :1411]
-    M   = IRIO.iloc[1411:-2, :1411]
-    VA  = IRIO.iloc[[-2], :1411]
-    Y_d = IRIO.iloc[:1411, 1411:-1]
-    Y_m = IRIO.iloc[1411:-2, 1411:-1]
-    x_j = IRIO.iloc[[-1], :1411]
-    x_i = IRIO.iloc[:1411, [-1]]
-    x_m = IRIO.iloc[1411:-2, [-1]]
+    return distance_17, distance_229
 
-    print("[DONE] Raw IO blocks extracted")
 
-    ## Sector name to ID mapping
-    def sector_allocation(idx):
-        return pd.MultiIndex.from_arrays(
-            [
-                idx.get_level_values(0),
-                idx.get_level_values(1).map(SECTOR_NAME_TO_ID_83),
-            ],
-            names=["Province", "Sector"],
-        )
+def restore_outputs(Z, M, VA, Y_d, Y_m, x_i, x_j, x_m):
 
-    Z.index = sector_allocation(Z.index)
-    Z.columns = Z.index
-    M.index = sector_allocation(M.index)
-    Y_d.index = sector_allocation(Y_d.index)
-    Y_m.index = sector_allocation(Y_m.index)
-    x_i.index = sector_allocation(x_i.index)
-    x_m.index = sector_allocation(x_m.index)
+    municipality_ids = list(MUNICIPALITIES_229.keys())
+    sector_ids_76 = list(SECTOR_76.keys())
 
-    sector_ids_83 = Z.index.get_level_values("Sector").dropna().unique().tolist()
+    Z = restore_io_labels(
+        Z,
+        municipality_ids,
+        sector_ids_76,
+        MUNICIPALITIES_229,
+        SECTOR_76,
+        axis="both",
+    )
 
-    print("[DONE] Sector name to ID mapping completed")
+    M = restore_io_labels(
+        M,
+        municipality_ids,
+        sector_ids_76,
+        MUNICIPALITIES_229,
+        SECTOR_76,
+        axis="both",
+        is_import=True,
+    )
 
-    ## Sectoral aggregation
+    VA = restore_io_labels(
+        VA,
+        municipality_ids,
+        sector_ids_76,
+        MUNICIPALITIES_229,
+        SECTOR_76,
+        axis="both",
+    )
+
+    x_j = restore_io_labels(
+        x_j,
+        municipality_ids,
+        sector_ids_76,
+        MUNICIPALITIES_229,
+        SECTOR_76,
+        axis="both",
+    )
+
+    Y_d = restore_io_labels(
+        Y_d,
+        municipality_ids,
+        sector_ids_76,
+        MUNICIPALITIES_229,
+        SECTOR_76,
+        axis="both",
+        fd_items=FINAL_DEMAND_ITEMS,
+    )
+
+    Y_m = restore_io_labels(
+        Y_m,
+        municipality_ids,
+        sector_ids_76,
+        MUNICIPALITIES_229,
+        SECTOR_76,
+        axis="both",
+        is_import=True,
+        fd_items=FINAL_DEMAND_ITEMS,
+    )
+
+    x_i = restore_io_labels(
+        x_i,
+        municipality_ids,
+        sector_ids_76,
+        MUNICIPALITIES_229,
+        SECTOR_76,
+        axis="both",
+    )
+
+    x_m = restore_io_labels(
+        x_m,
+        municipality_ids,
+        sector_ids_76,
+        MUNICIPALITIES_229,
+        SECTOR_76,
+        axis="both",
+        is_import=True,
+    )
+
+    return Z, M, VA, Y_d, Y_m, x_i, x_j, x_m
+
+
+def run_pipeline(
+    delta=0.30,
+    distance_name="travel_time",
+    final_demand_proxy="component",
+    out_dir=None,
+    diagnostics_dir=None,
+    save_outputs=True,
+    save_diagnostics=True,
+    save_allocation_report=True,
+    return_allocation_report=True,
+    verbose=True,
+):
+
+    ROOT = Path(__file__).resolve().parents[1]
+    DATA = ROOT / "data"
+
+    if out_dir is None:
+        out_dir = ROOT / "release" / "baseline"
+    if diagnostics_dir is None:
+        diagnostics_dir = ROOT / "release" / "diagnostics"
+
+    out_dir = Path(out_dir)
+    diagnostics_dir = Path(diagnostics_dir)
+
+    if save_outputs:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    if save_diagnostics:
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+
+    ## MRIO preprocessing
     (
         Z,
         Z_block,
@@ -84,35 +167,34 @@ def main():
         x_j,
         x_i,
         x_m,
-    ) = sectoral_aggregation(
-        Z,
-        M,
-        VA,
-        Y_d,
-        Y_m,
-        x_j,
-        x_i,
-        x_m,
-        sector_ids_83,
-        SECTOR_MAPPING_83_TO_76,
+    ) = mrio_preprocessing(
+        benchmark_path=DATA / "benchmark_io.csv",
+        SECTOR_83=SECTOR_83,
+        SECTOR_MAPPING_83_TO_76=SECTOR_MAPPING_83_TO_76,
     )
 
-    print("[DONE] Sectoral aggregation completed")
+    if verbose:
+        print("[DONE] MRIO preprocessing completed")
 
-    ## Load economic and employment data
+    ## Load municipal data
     grdp = pd.read_csv(DATA / "regional_grdp.csv")
+    population = pd.read_csv(DATA / "population_229.csv")
+    employment = pd.read_csv(DATA / "employment_229.csv")
+    expenditure = pd.read_csv(DATA / "local_government_expenditure_229.csv")
     zero = pd.read_csv(DATA / "zero_employee.csv")
-    
-    zero["sector"] = zero["Sector"].map(SECTOR_NAME_TO_ID_76)
 
-    zero_set = set(zip(zero["Province"], zero["ID"], zero["sector"]))
-    exception_set = {("Sejong", 72, SECTOR_NAME_TO_ID_76["Ships"])}
+    zero_set, exception_set = build_zero_set(
+        zero=zero,
+        SECTOR_NAME_TO_ID_76=SECTOR_NAME_TO_ID_76,
+        MUNICIPALITIES_229=MUNICIPALITIES_229,
+    )
 
-    print("[DONE] GRDP and employment data loaded")
+    if verbose:
+        print("[DONE] Municipal proxy data loaded")
 
-    ## Regional disaggregation
+    ## Municipal disaggregation
     (
-        Z,
+        Z_seed,
         M,
         Y_d,
         Y_m,
@@ -121,7 +203,7 @@ def main():
         x_i,
         x_m,
         Z_ref,
-    ) = regional_disaggregation(
+    ) = municipal_disaggregation(
         dict(
             Z=Z,
             M=M,
@@ -132,54 +214,82 @@ def main():
             x_i=x_i,
             x_m=x_m,
             region_hierarchy=REGION_HIERARCHY,
+            municipalities_229=MUNICIPALITIES_229,
             grdp=grdp,
+            population=population,
+            employment=employment,
+            expenditure=expenditure,
             zero_set=zero_set,
             exception_set=exception_set,
+            final_demand_proxy=final_demand_proxy,
         )
     )
 
-    print("[DONE] Regional disaggregation completed")
+    if verbose:
+        print("[DONE] Municipal disaggregation completed")
 
-    ## Load distance matrices
-    distance_229 = pd.read_csv(
-        DATA / "distance_229.csv",
-        header=[0, 1],
-        index_col=[0, 1],
+    ## Distance matrices
+    distance_17, distance_229 = load_distance(
+        DATA=DATA,
+        distance_name=distance_name,
     )
 
-    distance_229 = municipality_name_to_id(
-        distance_229=distance_229,
-        MUNICIPALITIES_229=MUNICIPALITIES_229,
-    )
+    if verbose:
+        print(f"[DONE] {distance_name} matrices loaded")
 
-    distance_17 = pd.read_csv(
-        DATA / "distance_17.csv",
-        index_col=0,
-    )
-
-    print("[DONE] Distance matrices loaded")
-
-    ## Gravity parameter estimation
-    coef_gravity = gravity_parameters(
+    ## Gravity parameters
+    gravity, denominator_zero = estimate_gravity(
         Z_ref=Z_ref,
         distance_17=distance_17,
-        verbose=True,
     )
 
-    print("[DONE] Gravity parameter estimation completed")
+    if save_diagnostics:
+        gravity.to_csv(
+            diagnostics_dir / "gravity_coefficients.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        denominator_zero.to_csv(
+            diagnostics_dir / "gravity_denominator_zero_cases.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
 
-    ## Interregional calibration
-    Z = gravity_calibration(
-        Z=Z,
+    if verbose:
+        print("[DONE] Gravity parameter estimation completed")
+
+    ## Positive and negative component handling
+    _, Z_seed_neg = split_signed(Z_seed)
+
+    Z_pos, gravity_table, allocation_report, allocation_summary = build_positive_seed(
+        Z_seed=Z_seed,
+        x_i_seed=x_i,
         distance_229=distance_229,
-        coef_gravity=coef_gravity,
+        gravity=gravity,
         zero_set=zero_set,
         exception_set=exception_set,
+        delta=delta,
     )
-    
-    print("[DONE] Interregional calibration completed")
 
-    ## Multi-regional balancing (MR-GRAS)
+    Z0 = Z_pos + Z_seed_neg
+
+    if save_diagnostics:
+        if save_allocation_report:
+            allocation_report.to_csv(
+                diagnostics_dir / "positive_allocation_report.csv",
+                index=False,
+                encoding="utf-8-sig",
+            )
+        pd.DataFrame([allocation_summary]).to_csv(
+            diagnostics_dir / "positive_allocation_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+    if verbose:
+        print("[DONE] Positive and signed baseline seeds completed")
+
+    ## Multi-regional balancing
     (
         Z,
         M,
@@ -191,7 +301,7 @@ def main():
         x_m,
         info,
     ) = multi_regional_gras(
-        Z=Z,
+        Z=Z0,
         Z_block=Z_block,
         M=M,
         VA=VA,
@@ -201,83 +311,86 @@ def main():
         x_j=x_j,
         x_m=x_m,
     )
- 
-    print("[DONE] Multi-regional balancing completed")
-    print("[INFO]", info)
+
+    if save_diagnostics:
+        pd.DataFrame([info]).to_csv(
+            diagnostics_dir / "mrgras_convergence.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+    if verbose:
+        print("[DONE] Multi-regional balancing completed")
 
     ## Label restoration
-    municipality_ids = list(MUNICIPALITIES_229.keys())
-    sector_ids_76 = list(SECTOR_76.keys())
-
-    Z = restore_io_labels(
-        Z, municipality_ids, sector_ids_76,
-        MUNICIPALITIES_229, SECTOR_76, axis="both"
+    Z, M, VA, Y_d, Y_m, x_i, x_j, x_m = restore_outputs(
+        Z=Z,
+        M=M,
+        VA=VA,
+        Y_d=Y_d,
+        Y_m=Y_m,
+        x_i=x_i,
+        x_j=x_j,
+        x_m=x_m,
     )
 
-    M = restore_io_labels(
-        M, municipality_ids, sector_ids_76,
-        MUNICIPALITIES_229, SECTOR_76,
-        axis="both", is_import=True
+    if verbose:
+        print("[DONE] Label restoration completed")
+
+    outputs = {
+        "Z": Z,
+        "M": M,
+        "Y_d": Y_d,
+        "Y_m": Y_m,
+        "VA": VA,
+        "x_i": x_i,
+        "x_j": x_j,
+        "x_m": x_m,
+        "gravity": gravity,
+        "denominator_zero": denominator_zero,
+        "allocation_summary": allocation_summary,
+        "mrgras_info": info,
+        "delta": delta,
+        "distance_name": distance_name,
+    }
+
+    if return_allocation_report:
+        outputs["allocation_report"] = allocation_report
+
+    ## Save outputs
+    if save_outputs:
+        matrices, MRIO, manifest = save_mrio(
+            out_dir=out_dir,
+            Z=Z,
+            M=M,
+            Y_d=Y_d,
+            Y_m=Y_m,
+            VA=VA,
+            x_i=x_i,
+            x_j=x_j,
+            x_m=x_m,
+            info=info,
+        )
+
+        outputs["matrices"] = matrices
+        outputs["MRIO"] = MRIO
+        outputs["manifest"] = manifest
+
+        if verbose:
+            print("[DONE] Baseline MRIO outputs saved")
+
+    return outputs
+
+
+def main():
+
+    run_pipeline(
+        delta=0.30,
+        distance_name="travel_time",
+        save_outputs=True,
+        verbose=True,
     )
 
-    VA = restore_io_labels(
-        VA, municipality_ids, sector_ids_76,
-        MUNICIPALITIES_229, SECTOR_76,
-        axis="both"
-    )
-
-    x_j = restore_io_labels(
-        x_j, municipality_ids, sector_ids_76,
-        MUNICIPALITIES_229, SECTOR_76,
-        axis="both"
-    )
-
-    Y_d = restore_io_labels(
-        Y_d, municipality_ids, sector_ids_76,
-        MUNICIPALITIES_229, SECTOR_76,
-        axis="both",
-        fd_items=FINAL_DEMAND_ITEMS
-    )
-
-    Y_m = restore_io_labels(
-        Y_m, municipality_ids, sector_ids_76,
-        MUNICIPALITIES_229, SECTOR_76,
-        axis="both",
-        is_import=True,
-        fd_items=FINAL_DEMAND_ITEMS
-    )
-
-    x_i = restore_io_labels(
-        x_i, municipality_ids, sector_ids_76,
-        MUNICIPALITIES_229, SECTOR_76,
-        axis="both"
-    )
-
-    x_m = restore_io_labels(
-        x_m, municipality_ids, sector_ids_76,
-        MUNICIPALITIES_229, SECTOR_76,
-        axis="both",
-        is_import=True
-    ) 
-
-    print("[DONE] Label restoration completed")
-
-    ## Final MRIO merge
-    MRIO = merge_io(
-        Z,
-        M,
-        VA,
-        x_j,
-        Y_d,
-        Y_m,
-        x_i,
-        x_m,
-    )
-
-    MRIO = sanitize_for_parquet(MRIO)
-    MRIO.to_parquet(OUT / "MRIO.parquet")
-
-    print("[DONE] MRIO dataset merged and saved")
 
 if __name__ == "__main__":
     main()
