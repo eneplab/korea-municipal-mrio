@@ -1,6 +1,6 @@
 # Municipal MRIO Korea 2020
 
-This repository contains the Python workflow used to construct a benchmark-consistent municipality-level multi-regional input-output (MRIO) dataset for Korea in 2020.
+This repository contains the Python workflow used to construct a municipality-level multi-regional input-output (MRIO) dataset for Korea in 2020.
 
 The workflow reconstructs the dataset from the input files in `data/` and metadata in `metadata/`. The finalized data release is distributed separately through Zenodo.
 
