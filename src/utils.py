@@ -1,6 +1,8 @@
 # src/utils.py
 
+import numpy as np
 import pandas as pd
+
 
 ## Convert distance matrix index from names to municipality IDs
 def municipality_name_to_id(distance_229, MUNICIPALITIES_229):
@@ -24,7 +26,6 @@ def municipality_name_to_id(distance_229, MUNICIPALITIES_229):
 
     distance_id = pd.DataFrame(index=new_index, columns=new_columns)
 
-    # Map distance values
     for (province_row, municipality_row), region_id_row in name_to_id.items():
         for (province_col, municipality_col), region_id_col in name_to_id.items():
 
@@ -37,6 +38,73 @@ def municipality_name_to_id(distance_229, MUNICIPALITIES_229):
                 ]
 
     return distance_id.astype(float)
+
+
+## Map municipality names to IDs in regional data
+def add_municipality_id(data, MUNICIPALITIES_229):
+
+    name_to_id = {
+        (province, municipality): region_id
+        for region_id, (province, municipality) in MUNICIPALITIES_229.items()
+    }
+
+    data = data.copy()
+    data["ID"] = [
+        name_to_id.get((p, m), np.nan)
+        for p, m in zip(data["Province"], data["Municipality"])
+    ]
+
+    if data["ID"].isna().any():
+        missing = data.loc[data["ID"].isna(), ["Province", "Municipality"]]
+        raise RuntimeError(f"Municipality ID mapping failed: {missing.to_dict('records')}")
+
+    data["ID"] = data["ID"].astype(int)
+
+    return data
+
+
+## Build zero-employment support set
+def build_zero_set(zero, SECTOR_NAME_TO_ID_76, MUNICIPALITIES_229):
+
+    zero = add_municipality_id(zero, MUNICIPALITIES_229)
+    zero["sector"] = zero["Sector"].map(SECTOR_NAME_TO_ID_76)
+    zero = zero.dropna(subset=["sector"]).copy()
+    zero["sector"] = zero["sector"].astype(int)
+
+    zero_set = set(zip(zero["Province"], zero["ID"], zero["sector"]))
+    exception_set = {("Sejong", 72, SECTOR_NAME_TO_ID_76["Ships"])}
+
+    return zero_set, exception_set
+
+
+def is_zero(p, m, sector, zero_set, exception_set):
+
+    return (p, m, sector) in zero_set and (p, m, sector) not in exception_set
+
+
+## Signed component split
+def split_signed(Z):
+
+    Z_pos = Z.clip(lower=0)
+    Z_neg = Z.clip(upper=0)
+
+    return Z_pos, Z_neg
+
+
+## Kernel normalization
+def normalize_kernel(kernel, allowed, eps=1e-12):
+
+    kernel = np.where(allowed, kernel, 0.0)
+    kernel_sum = kernel.sum()
+
+    if kernel_sum > eps:
+        return kernel / kernel_sum, "kernel"
+
+    if allowed.sum() > 0:
+        return np.zeros_like(kernel), "zero_denominator"
+
+    return np.zeros_like(kernel), "zero_support"
+
 
 ## Restore multi-index labels
 def restore_io_labels(
@@ -51,7 +119,6 @@ def restore_io_labels(
 ):
     df = obj.copy()
 
-    # Reset index
     df.index = range(len(df.index))
     df.columns = range(len(df.columns))
 
@@ -60,7 +127,6 @@ def restore_io_labels(
             return ""
         return str(x)
 
-    # Index builders
     def build_io_index():
 
         province = []
@@ -96,6 +162,7 @@ def restore_io_labels(
 
         if isinstance(label, tuple):
             label = label[-1]
+
         return pd.MultiIndex.from_arrays(
             [["Account"], [""], [safe(label)]],
             names=["Province", "Municipality", "Sector"],
@@ -121,7 +188,6 @@ def restore_io_labels(
             names=["Province", "Municipality", "Final Demand"],
         )
 
-    ## Apply index
     if axis in ("index", "both"):
 
         if is_import:
@@ -133,7 +199,6 @@ def restore_io_labels(
         else:
             df.index = build_io_index()
 
-    # Apply columns
     if axis in ("columns", "both"):
 
         if fd_items is not None:
@@ -160,7 +225,6 @@ def merge_io(
     x_m,
 ):
 
-    # Row blocks
     trade_va_input = pd.concat(
         [Z, M, VA, x_j],
         axis=0,
@@ -176,13 +240,13 @@ def merge_io(
         axis=0,
     )
 
-    # Column merge
     MRIO = pd.concat(
         [trade_va_input, final_demand, total_output],
         axis=1,
     )
 
     return MRIO
+
 
 ## Convert all values to float for parquet format
 def sanitize_for_parquet(MRIO):
