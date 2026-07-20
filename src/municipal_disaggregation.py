@@ -24,10 +24,9 @@ def municipal_disaggregation(data):
     municipalities_229 = data["municipalities_229"]
     grdp = data["grdp"]
     population = data["population"]
-    employment = data["employment"]
     expenditure = data["expenditure"]
-    zero_set = data.get("zero_set", set())
-    exception_set = data.get("exception_set", set())
+    inactive = data.get("inactive", set())
+    exceptions = data.get("exceptions", set())
     final_demand_proxy = data.get("final_demand_proxy", "component")
 
     ## Dimensions
@@ -54,15 +53,11 @@ def municipal_disaggregation(data):
     ## Regional data
     grdp = add_municipality_id(grdp, municipalities_229)
     population = add_municipality_id(population, municipalities_229)
-    employment = add_municipality_id(employment, municipalities_229)
     expenditure = add_municipality_id(expenditure, municipalities_229)
 
     grdp["GRDP"] = pd.to_numeric(grdp["GRDP"], errors="coerce").fillna(0.0)
     population["Population"] = pd.to_numeric(
         population["Population"], errors="coerce"
-    ).fillna(0.0)
-    employment["Employment"] = pd.to_numeric(
-        employment["Employment"], errors="coerce"
     ).fillna(0.0)
     expenditure["general_account_expenditure"] = pd.to_numeric(
         expenditure["general_account_expenditure"], errors="coerce"
@@ -70,10 +65,6 @@ def municipal_disaggregation(data):
     expenditure["special_account_expenditure"] = pd.to_numeric(
         expenditure["special_account_expenditure"], errors="coerce"
     ).fillna(0.0)
-    expenditure["local_government_expenditure"] = (
-        expenditure["general_account_expenditure"]
-        + expenditure["special_account_expenditure"]
-    )
 
     grdp_map = {
         p: grdp.loc[grdp["Province"] == p].set_index("ID")["GRDP"]
@@ -83,18 +74,19 @@ def municipal_disaggregation(data):
         p: population.loc[population["Province"] == p].set_index("ID")["Population"]
         for p in provinces
     }
-    employment_map = {
-        p: employment.loc[employment["Province"] == p].set_index("ID")["Employment"]
+    general_expenditure_map = {
+        p: expenditure.loc[expenditure["Province"] == p]
+        .set_index("ID")["general_account_expenditure"]
         for p in provinces
     }
-    expenditure_map = {
+    special_expenditure_map = {
         p: expenditure.loc[expenditure["Province"] == p]
-        .set_index("ID")["local_government_expenditure"]
+        .set_index("ID")["special_account_expenditure"]
         for p in provinces
     }
 
-    def is_zero(p, m, sector):
-        return (p, m, sector) in zero_set and (p, m, sector) not in exception_set
+    def is_inactive(p, m, sector):
+        return (p, m, sector) in inactive and (p, m, sector) not in exceptions
 
     def normalized_weight(series, municipalities):
         values = series.reindex(municipalities).fillna(0.0).astype(float)
@@ -112,11 +104,14 @@ def municipal_disaggregation(data):
         if "Private Final Consumption" in fd:
             return normalized_weight(population_map[p], municipalities)
 
-        if "Government" in fd:
-            return normalized_weight(expenditure_map[p], municipalities)
+        if "Government Final Consumption" in fd:
+            return normalized_weight(general_expenditure_map[p], municipalities)
+
+        if "Government Gross Fixed Capital" in fd:
+            return normalized_weight(special_expenditure_map[p], municipalities)
 
         if "Private Gross Fixed Capital" in fd:
-            return normalized_weight(employment_map[p], municipalities)
+            return normalized_weight(grdp_map[p], municipalities)
 
         return normalized_weight(grdp_map[p], municipalities)
 
@@ -130,7 +125,7 @@ def municipal_disaggregation(data):
         municipalities = region_hierarchy[p]
 
         for sector in sectors:
-            active = [m for m in municipalities if not is_zero(p, m, sector)]
+            active = [m for m in municipalities if not is_inactive(p, m, sector)]
             active_municipalities[(p, sector)] = active
 
             w = np.zeros(len(active))
@@ -140,7 +135,7 @@ def municipal_disaggregation(data):
                     w = g.reindex(active).values / grdp_total
             W_inter[(p, sector)] = w
 
-    # Final demand weights: no zero-employment support constraint
+    # Final demand weights are not subject to the production activity condition.
     W_fd = {
         (p, fd): fd_weight(p, fd)
         for p in fd_provinces

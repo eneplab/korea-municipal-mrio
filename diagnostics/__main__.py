@@ -1,164 +1,237 @@
-# diagnostics/__main__.py
-
 from pathlib import Path
-import warnings
 
 import numpy as np
 import pandas as pd
 
-from metadata.sector import SECTOR_76, SECTOR_83, SECTOR_MAPPING_83_TO_76
-
-from src.metrics import (
-    gravity_summary,
-    positive_spatial_composition,
-    zero_employment_support_check,
-)
+from metadata.sector import SECTOR_83, SECTOR_MAPPING_83_TO_76
 from src.mrio_io import load_mrio
 from src.mrio_preprocessing import mrio_preprocessing
 
 
-warnings.filterwarnings("ignore")
+def aggregate_province_blocks(Z):
+    Z = Z.groupby(level="Province").sum()
+    return Z.T.groupby(level="Province").sum().T
 
 
-def aggregate_municipal_Z(Z):
+def constraint_residuals(mrio, W, eps=1e-12):
+    Z = mrio.Z
+    x_i = mrio.X.iloc[:, 0]
+    x_j = mrio.input_total.iloc[0, :]
+    u = x_i - mrio.Y_d.sum(axis=1)
+    v = x_j - mrio.M.sum(axis=0) - mrio.VA.sum(axis=0)
 
-    idx = Z.index.to_frame(index=False)
-    col = Z.columns.to_frame(index=False)
+    x_i_safe = x_i.abs().copy()
+    x_i_safe[x_i_safe < 1e-6] = 1.0
+    u[(u.abs() < 1e-3) & ((u.abs() / x_i_safe) < 1e-7)] = 0.0
 
-    name_to_id = {name: sector_id for sector_id, name in SECTOR_76.items()}
+    x_j_safe = x_j.abs().copy()
+    x_j_safe[x_j_safe < 1e-6] = 1.0
+    v[(v.abs() < 1e-3) & ((v.abs() / x_j_safe) < 1e-7)] = 0.0
 
-    if idx["Sector"].dtype == object:
-        idx["Sector"] = idx["Sector"].map(name_to_id).fillna(idx["Sector"])
-    if col["Sector"].dtype == object:
-        col["Sector"] = col["Sector"].map(name_to_id).fillna(col["Sector"])
+    row_error = (Z.sum(axis=1) - u).abs()
+    col_error = (Z.sum(axis=0) - v).abs()
 
-    Z = Z.copy()
-    Z.index = pd.MultiIndex.from_frame(
-        idx[["Province", "Sector"]],
-        names=["Province", "Sector"],
+    Z_block = aggregate_province_blocks(Z)
+    Z_block, W = Z_block.align(W, join="inner", axis=None)
+    block_error = (Z_block - W).abs()
+
+    def scaled(error, target):
+        return float(
+            np.max(
+                error.to_numpy() / np.maximum(np.abs(target.to_numpy()), 1.0),
+                initial=0.0,
+            )
+        )
+
+    zero_error = max(
+        float(row_error[u.abs() <= eps].max()) if (u.abs() <= eps).any() else 0.0,
+        float(col_error[v.abs() <= eps].max()) if (v.abs() <= eps).any() else 0.0,
+        float(block_error[W.abs() <= eps].max().max())
+        if (W.abs() <= eps).any().any()
+        else 0.0,
     )
-    Z.columns = pd.MultiIndex.from_frame(
-        col[["Province", "Sector"]],
-        names=["Province", "Sector"],
-    )
-
-    return (
-        Z
-        .groupby(level=["Province", "Sector"], axis=0)
-        .sum()
-        .groupby(level=["Province", "Sector"], axis=1)
-        .sum()
-    )
-
-
-def province_sector_difference(ROOT, Z):
-
-    Z_bench, *_ = mrio_preprocessing(
-        benchmark_path=ROOT / "data" / "benchmark_io.csv",
-        SECTOR_83=SECTOR_83,
-        SECTOR_MAPPING_83_TO_76=SECTOR_MAPPING_83_TO_76,
-    )
-
-    Z_agg = aggregate_municipal_Z(Z)
-    Z_bench, Z_agg = Z_bench.align(Z_agg, join="inner", axis=None)
-
-    diff = Z_agg.to_numpy() - Z_bench.to_numpy()
-    bench = Z_bench.to_numpy()
 
     return {
-        "province_sector_abs_diff_sum": float(np.abs(diff).sum()),
-        "province_sector_relative_abs_diff": (
-            float(np.abs(diff).sum() / np.abs(bench).sum())
-            if np.abs(bench).sum() != 0
-            else 0.0
+        "row_abs": float(row_error.max()),
+        "column_abs": float(col_error.max()),
+        "block_abs": float(block_error.max().max()),
+        "scaled": max(
+            scaled(row_error, u),
+            scaled(col_error, v),
+            scaled(block_error, W),
         ),
-        "province_sector_max_abs_diff": float(np.abs(diff).max()),
+        "zero_target_abs": zero_error,
+        "block_relative": float(
+            block_error.to_numpy().sum() / np.abs(W.to_numpy()).sum()
+        ),
     }
 
 
-def gravity_sector_table(ROOT):
+def production_activity_violations(mrio, zero, eps=1e-12):
+    zero = zero.copy()
+    for column in ("Province", "Municipality", "Sector"):
+        zero[column] = zero[column].astype(str).str.strip()
 
-    gravity = pd.read_csv(ROOT / "release" / "diagnostics" / "gravity_coefficients.csv")
-    gravity = gravity.copy()
-    gravity["sector_name"] = gravity["input_sector"].map(SECTOR_76)
+    inactive = set(
+        map(
+            tuple,
+            zero[["Province", "Municipality", "Sector"]].astype(str).to_numpy(),
+        )
+    )
+    inactive.discard(("Sejong", "Sejong-si", "Ships"))
 
-    keep = [
-        "input_sector",
-        "sector_name",
-        "method",
-        "n_obs",
-        "gamma",
-        "log_distance_coef",
-        "log_distance_p",
-        "r2",
-        "adj_r2",
-        "positive_flow_count",
-        "denominator_zero_count",
-    ]
+    idx = mrio.Z.index.to_frame(index=False)
+    keys = list(
+        map(
+            tuple,
+            idx[["Province", "Municipality", "Sector"]].astype(str).to_numpy(),
+        )
+    )
+    mask = pd.Series(keys).isin(inactive).to_numpy()
 
-    return gravity[keep]
+    amounts = (
+        mrio.Z.iloc[mask, :].abs().sum(axis=1).to_numpy()
+        + mrio.Z.iloc[:, mask].abs().sum(axis=0).to_numpy()
+        + mrio.M.iloc[:, mask].abs().sum(axis=0).to_numpy()
+        + mrio.Y_d.iloc[mask, :].abs().sum(axis=1).to_numpy()
+        + mrio.VA.iloc[:, mask].abs().sum(axis=0).to_numpy()
+        + mrio.X.iloc[mask, 0].abs().to_numpy()
+    )
+
+    return {
+        "count": int((amounts > eps).sum()),
+        "absolute_sum": float(amounts.sum()),
+    }
+
+
+def add(rows, section, metric, value, tolerance="", status="INFO"):
+    rows.append(
+        {
+            "Section": section,
+            "Metric": metric,
+            "Value": value,
+            "Tolerance": tolerance,
+            "Status": status,
+        }
+    )
 
 
 def main():
-
-    ROOT = Path(__file__).resolve().parents[1]
-    OUT = ROOT / "release" / "diagnostics"
-    OUT.mkdir(parents=True, exist_ok=True)
-
+    root = Path(__file__).resolve().parents[1]
+    release = root / "release"
     print("[RUN] Diagnostics")
 
-    mrio = load_mrio(ROOT / "release" / "baseline", as_object=True)
-    gravity = pd.read_csv(OUT / "gravity_coefficients.csv")
-    allocation = pd.read_csv(OUT / "positive_allocation_summary.csv")
-    convergence = pd.read_csv(OUT / "mrgras_convergence.csv")
-    zero = pd.read_csv(ROOT / "data" / "zero_employee.csv")
+    mrio = load_mrio(release)
+    if mrio.manifest is None:
+        raise FileNotFoundError(release / "manifest.json")
 
-    exception = {("Sejong", "Sejong-si", "Ships")}
-
-    support = zero_employment_support_check(
-        matrices={
-            "Z": mrio.Z,
-            "M": mrio.M,
-            "Y_d": mrio.Y_d,
-            "VA": mrio.VA,
-            "x_i": mrio.x_i,
-            "x_j": mrio.x_j,
-        },
-        zero=zero,
-        exception=exception,
+    Z_bench, *_ = mrio_preprocessing(
+        benchmark_path=root / "data" / "benchmark_io.csv",
+        SECTOR_83=SECTOR_83,
+        SECTOR_MAPPING_83_TO_76=SECTOR_MAPPING_83_TO_76,
     )
-    support.to_csv(
-        OUT / "zero_employment_support_check.csv",
+    W = aggregate_province_blocks(Z_bench)
+    residuals = constraint_residuals(mrio, W)
+    activity = production_activity_violations(
+        mrio,
+        pd.read_csv(root / "data" / "zero_employee.csv"),
+    )
+
+    balancing = mrio.manifest["balancing"]
+    mult_tol = float(balancing["multiplier_tolerance"])
+    constraint_tol = float(balancing["constraint_tolerance"])
+
+    rows = []
+    add(
+        rows,
+        "Accounting consistency",
+        "MR-GRAS converged",
+        bool(balancing["converged"]),
+        "",
+        "PASS" if balancing["converged"] else "FAIL",
+    )
+    add(
+        rows,
+        "Accounting consistency",
+        "MR-GRAS iterations",
+        int(balancing["iterations"]),
+    )
+    add(
+        rows,
+        "Accounting consistency",
+        "Maximum multiplier change",
+        float(balancing["max_multiplier_change"]),
+        mult_tol,
+        "PASS" if balancing["max_multiplier_change"] < mult_tol else "FAIL",
+    )
+    add(
+        rows,
+        "Accounting consistency",
+        "Maximum scaled constraint residual",
+        residuals["scaled"],
+        constraint_tol,
+        "PASS" if residuals["scaled"] < constraint_tol else "FAIL",
+    )
+    add(
+        rows,
+        "Accounting consistency",
+        "Maximum zero-target absolute residual",
+        residuals["zero_target_abs"],
+        constraint_tol,
+        "PASS" if residuals["zero_target_abs"] < constraint_tol else "FAIL",
+    )
+    add(
+        rows,
+        "Accounting consistency",
+        "Maximum row absolute residual",
+        residuals["row_abs"],
+    )
+    add(
+        rows,
+        "Accounting consistency",
+        "Maximum column absolute residual",
+        residuals["column_abs"],
+    )
+    add(
+        rows,
+        "Accounting consistency",
+        "Maximum province-pair block absolute residual",
+        residuals["block_abs"],
+    )
+    add(
+        rows,
+        "Production activity condition",
+        "Violation count",
+        activity["count"],
+        0,
+        "PASS" if activity["count"] == 0 else "FAIL",
+    )
+    add(
+        rows,
+        "Production activity condition",
+        "Absolute violation sum",
+        activity["absolute_sum"],
+        1e-12,
+        "PASS" if activity["absolute_sum"] <= 1e-12 else "FAIL",
+    )
+    add(
+        rows,
+        "Benchmark consistency",
+        "Maximum province-pair block difference",
+        residuals["block_abs"],
+    )
+    add(
+        rows,
+        "Benchmark consistency",
+        "Relative absolute province-pair block difference",
+        residuals["block_relative"],
+    )
+
+    pd.DataFrame(rows).to_csv(
+        release / "diagnostic_summary.csv",
         index=False,
         encoding="utf-8-sig",
     )
-
-    sector_table = gravity_sector_table(ROOT)
-    sector_table.to_csv(
-        OUT / "gravity_sector_diagnostics.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
-
-    spatial = positive_spatial_composition(mrio.Z)
-    province_sector = province_sector_difference(ROOT, mrio.Z)
-    gravity_stats = gravity_summary(gravity)
-
-    summary = {}
-    summary.update(spatial)
-    summary.update(province_sector)
-    summary.update(gravity_stats)
-    summary.update(allocation.iloc[0].to_dict())
-    summary.update(convergence.iloc[0].to_dict())
-    summary["zero_employment_violation_abs_sum"] = float(support["abs_sum"].sum())
-    summary["zero_employment_violation_count"] = int(support["nonzero_count"].sum())
-
-    pd.DataFrame([summary]).to_csv(
-        OUT / "diagnostic_summary.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
-
     print("[DONE] Diagnostics completed")
 
 

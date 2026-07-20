@@ -2,17 +2,13 @@
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 from src.intramunicipal_allocation import calculate_flq_intra
-from src.utils import is_zero, normalize_kernel
+from src.utils import group_sum, is_inactive, normalize_kernel
 
 
 EPS = 1e-12
-
-try:
-    from scipy import stats
-except Exception:
-    stats = None
 
 
 def fit_log_ols(obs, variable_names):
@@ -35,10 +31,7 @@ def fit_log_ols(obs, variable_names):
     if n_obs <= n_params:
         return None
 
-    try:
-        beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
-    except Exception:
-        return None
+    beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
 
     y_hat = X @ beta
     resid = y - y_hat
@@ -58,7 +51,7 @@ def fit_log_ols(obs, variable_names):
     try:
         xtx_inv = np.linalg.inv(X.T @ X)
         se = np.sqrt(np.diag(xtx_inv) * sigma2)
-    except Exception:
+    except np.linalg.LinAlgError:
         se = np.full(n_params, np.nan)
 
     t_stat = np.divide(
@@ -68,10 +61,7 @@ def fit_log_ols(obs, variable_names):
         where=se > EPS,
     )
 
-    if stats is not None:
-        p_value = 2.0 * stats.t.sf(np.abs(t_stat), df=n_obs - n_params)
-    else:
-        p_value = np.full(n_params, np.nan)
+    p_value = 2.0 * stats.t.sf(np.abs(t_stat), df=n_obs - n_params)
 
     result = {
         "n_obs": n_obs,
@@ -98,15 +88,12 @@ def estimate_gravity(Z_ref, distance_17):
     sectors = Z_pos.index.get_level_values("Sector").unique().tolist()
 
     results = []
-    zero_cases = []
-
     for i in sectors:
 
-        trade_flows = (
-            Z_pos
-            .xs(i, level="Sector")
-            .groupby(level="Province", axis=1)
-            .sum()
+        trade_flows = group_sum(
+            Z_pos.xs(i, level="Sector"),
+            level="Province",
+            axis=1,
         )
 
         origin = trade_flows.sum(axis=1)
@@ -136,17 +123,6 @@ def estimate_gravity(Z_ref, distance_17):
 
                 if O_R <= 0 or D_S <= 0 or dist <= 0:
                     denominator_zero_count += 1
-                    zero_cases.append(
-                        {
-                            "input_sector": i,
-                            "R": R,
-                            "S": S,
-                            "T_RS": T_RS,
-                            "O_R": O_R,
-                            "D_S": D_S,
-                            "distance": dist,
-                        }
-                    )
                     continue
 
                 obs.append(
@@ -182,15 +158,14 @@ def estimate_gravity(Z_ref, distance_17):
             )
         else:
             row.update(result)
-            row["method"] = "yamada_like_gravity"
+            row["method"] = "gravity"
             row["gamma"] = -row["log_distance_coef"]
 
         results.append(row)
 
     gravity = pd.DataFrame(results)
-    zero_cases = pd.DataFrame(zero_cases)
 
-    return gravity, zero_cases
+    return gravity
 
 
 def build_positive_seed(
@@ -198,8 +173,8 @@ def build_positive_seed(
     x_i_seed,
     distance_229,
     gravity,
-    zero_set,
-    exception_set,
+    inactive,
+    exceptions,
     delta=0.30,
 ):
 
@@ -230,11 +205,6 @@ def build_positive_seed(
         for i in sectors
     }
 
-    ## Positive output vector
-    x = x_i_seed.iloc[:, 0].rename("x").astype(float)
-    x.index.names = ["Province", "Municipality", "Sector"]
-    x_pos = x.clip(lower=0)
-
     ## Positive origin mass
     origin_mass = Z_seed.clip(lower=0).sum(axis=1).values
 
@@ -248,11 +218,11 @@ def build_positive_seed(
     for i in sectors:
         row_pos_i = np.concatenate([positions[(R, i)] for R in provinces])
         destination_mass.loc[i] = (
-            Z_seed
-            .iloc[row_pos_i, :]
-            .clip(lower=0)
-            .groupby(level="Municipality", axis=1)
-            .sum()
+            group_sum(
+                Z_seed.iloc[row_pos_i, :].clip(lower=0),
+                level="Municipality",
+                axis=1,
+            )
             .sum(axis=0)
             .reindex(all_municipalities)
             .fillna(0.0)
@@ -260,7 +230,7 @@ def build_positive_seed(
         )
 
     ## FLQ intramunicipal estimate
-    flq_ijr, flq_sum, flq_summary = calculate_flq_intra(
+    flq_ijr, flq_sum, _ = calculate_flq_intra(
         Z_seed=Z_seed,
         x_i_seed=x_i_seed,
         delta=delta,
@@ -288,8 +258,6 @@ def build_positive_seed(
         Z_pos_new[np.ix_(row_pos, col_pos)] = mat
 
     ## Intermunicipal allocation
-    allocation_records = []
-
     distance_values = distance_229.loc[
         all_municipalities,
         all_municipalities,
@@ -363,13 +331,13 @@ def build_positive_seed(
 
                 active_origin = np.array(
                     [
-                        not is_zero(R, r, i, zero_set, exception_set)
+                        not is_inactive(R, r, i, inactive, exceptions)
                         for r in R_municipalities
                     ],
                     dtype=bool,
                 )
 
-                if method == "yamada_like_gravity":
+                if method == "gravity":
                     base_kernel = (
                         (O_vec[:, None] ** alpha)
                         * (D_vec[None, :] ** beta)
@@ -391,7 +359,7 @@ def build_positive_seed(
 
                     active_destination = np.array(
                         [
-                            not is_zero(S, s, j, zero_set, exception_set)
+                            not is_inactive(S, s, j, inactive, exceptions)
                             for s in S_municipalities
                         ],
                         dtype=bool,
@@ -402,29 +370,14 @@ def build_positive_seed(
                     if R == S:
                         np.fill_diagonal(allowed, False)
 
-                    weights, allocation_method = normalize_kernel(
+                    weights = normalize_kernel(
                         kernel=base_kernel,
                         allowed=allowed,
                     )
 
-                    allocated = 0.0
-                    if allocation_method == "kernel":
+                    if weights.sum() > EPS:
                         allocated_value = value * weights
                         Z_pos_new[np.ix_(row_pos_i, col_pos_j)] += allocated_value
-                        allocated = float(allocated_value.sum())
-
-                    allocation_records.append(
-                        {
-                            "R": R,
-                            "S": S,
-                            "input_sector": i,
-                            "purchasing_sector": j,
-                            "target": value,
-                            "allocated": allocated,
-                            "method": method,
-                            "allocation_method": allocation_method,
-                        }
-                    )
 
     Z_pos = pd.DataFrame(
         Z_pos_new,
@@ -432,50 +385,4 @@ def build_positive_seed(
         columns=Z_seed.columns,
     )
 
-    allocation_report = pd.DataFrame(allocation_records)
-
-    target_pos = (
-        Z_seed.clip(lower=0)
-        .groupby(level=["Province", "Sector"], axis=0)
-        .sum()
-        .groupby(level=["Province", "Sector"], axis=1)
-        .sum()
-    )
-
-    result_pos = (
-        Z_pos
-        .groupby(level=["Province", "Sector"], axis=0)
-        .sum()
-        .groupby(level=["Province", "Sector"], axis=1)
-        .sum()
-    )
-
-    diff = result_pos - target_pos
-
-    summary = {
-        "total_target": float(target_pos.values.sum()),
-        "total_result": float(result_pos.values.sum()),
-        "total_unallocated": float(
-            allocation_report["target"].sum() - allocation_report["allocated"].sum()
-        ),
-        "max_abs_block_diff": float(np.abs(diff.values).max()),
-        "allocation_rows": len(allocation_report),
-        "gravity_rows": int(
-            (allocation_report["method"] == "yamada_like_gravity").sum()
-        ),
-        "simple_trade_rows": int(
-            (allocation_report["method"] == "simple_trade").sum()
-        ),
-        "kernel_rows": int(
-            (allocation_report["allocation_method"] == "kernel").sum()
-        ),
-        "zero_denominator_rows": int(
-            (allocation_report["allocation_method"] == "zero_denominator").sum()
-        ),
-        "zero_support_rows": int(
-            (allocation_report["allocation_method"] == "zero_support").sum()
-        ),
-    }
-    summary.update(flq_summary)
-
-    return Z_pos, gravity, allocation_report, summary
+    return Z_pos

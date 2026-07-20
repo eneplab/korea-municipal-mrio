@@ -3,6 +3,8 @@
 import numpy as np
 import pandas as pd
 
+from src.utils import group_sum
+
 
 def calculate_flq_intra(Z_seed, x_i_seed, delta=0.30, eps=1e-12):
 
@@ -85,12 +87,11 @@ def calculate_flq_intra(Z_seed, x_i_seed, delta=0.30, eps=1e-12):
             .clip(lower=0)
         )
 
-        Z_ij_pp = (
-            Z_pp
-            .groupby(level="Sector", axis=0, sort=False)
-            .sum()
-            .groupby(level="Sector", axis=1, sort=False)
-            .sum()
+        Z_ij_pp = group_sum(
+            group_sum(Z_pp, level="Sector", axis=0, sort=False),
+            level="Sector",
+            axis=1,
+            sort=False,
         )
 
         x_j_R = x_ip.xs(R, level="Province").reindex(Z_ij_pp.columns).fillna(0)
@@ -156,14 +157,38 @@ def calculate_flq_intra(Z_seed, x_i_seed, delta=0.30, eps=1e-12):
     flq_ijr["SLQ_j"] = flq_ijr["SLQ_j"].fillna(0)
     flq_ijr["lambda_r"] = flq_ijr["lambda_r"].fillna(0)
 
-    flq_ijr["CILQ"] = np.where(
-        flq_ijr["SLQ_j"] > eps,
-        flq_ijr["SLQ_i"] / flq_ijr["SLQ_j"],
-        0.0,
+    flq_ijr["is_diag"] = (
+        flq_ijr["input_sector"] == flq_ijr["purchasing_sector"]
     )
 
-    flq_ijr["FLQ"] = flq_ijr["CILQ"] * flq_ijr["lambda_r"]
-    flq_ijr["phi"] = np.minimum(flq_ijr["FLQ"], 1.0)
+    flq_ijr["CILQ"] = np.divide(
+        flq_ijr["SLQ_i"],
+        flq_ijr["SLQ_j"],
+        out=np.zeros(len(flq_ijr), dtype=float),
+        where=flq_ijr["SLQ_j"] > eps,
+    )
+
+    flq_ijr["LQ"] = np.where(
+        flq_ijr["is_diag"],
+        flq_ijr["SLQ_i"],
+        flq_ijr["CILQ"],
+    )
+
+    flq_ijr["FLQ"] = flq_ijr["LQ"] * flq_ijr["lambda_r"]
+    flq_ijr["phi"] = np.clip(flq_ijr["FLQ"], 0.0, 1.0)
+
+    if not np.isfinite(flq_ijr["FLQ"]).all():
+        raise ValueError("FLQ contains non-finite values.")
+
+    if not flq_ijr["phi"].between(0.0, 1.0).all():
+        raise ValueError("FLQ adjustment factor is outside [0, 1].")
+
+    diag = flq_ijr["is_diag"]
+    if not np.allclose(
+        flq_ijr.loc[diag, "FLQ"],
+        flq_ijr.loc[diag, "SLQ_i"] * flq_ijr.loc[diag, "lambda_r"],
+    ):
+        raise ValueError("Diagonal FLQ entries do not match SLQ_i * lambda_r.")
 
     ## Intramunicipal positive estimate
     x_jr = (

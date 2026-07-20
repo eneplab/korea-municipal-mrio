@@ -1,5 +1,7 @@
 # src/utils.py
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -63,30 +65,34 @@ def add_municipality_id(data, MUNICIPALITIES_229):
     return data
 
 
-## Build zero-employment support set
-def build_zero_set(zero, SECTOR_NAME_TO_ID_76, MUNICIPALITIES_229):
+## Build production activity condition sets
+def build_activity_sets(zero, SECTOR_NAME_TO_ID_76, MUNICIPALITIES_229):
+
+    zero = zero.copy()
+    for column in ("Province", "Municipality", "Sector"):
+        zero[column] = zero[column].astype(str).str.strip()
 
     zero = add_municipality_id(zero, MUNICIPALITIES_229)
     zero["sector"] = zero["Sector"].map(SECTOR_NAME_TO_ID_76)
     zero = zero.dropna(subset=["sector"]).copy()
     zero["sector"] = zero["sector"].astype(int)
 
-    zero_set = set(zip(zero["Province"], zero["ID"], zero["sector"]))
-    exception_set = {("Sejong", 72, SECTOR_NAME_TO_ID_76["Ships"])}
+    inactive = set(zip(zero["Province"], zero["ID"], zero["sector"]))
+    exceptions = {("Sejong", 72, SECTOR_NAME_TO_ID_76["Ships"])}
 
-    return zero_set, exception_set
+    return inactive, exceptions
 
 
-def is_zero(p, m, sector, zero_set, exception_set):
+def is_inactive(p, m, sector, inactive, exceptions):
 
-    return (p, m, sector) in zero_set and (p, m, sector) not in exception_set
+    return (p, m, sector) in inactive and (p, m, sector) not in exceptions
 
 
 ## Signed component split
 def split_signed(Z):
 
     Z_pos = Z.clip(lower=0)
-    Z_neg = Z.clip(upper=0)
+    Z_neg = (-Z).clip(lower=0)
 
     return Z_pos, Z_neg
 
@@ -98,12 +104,19 @@ def normalize_kernel(kernel, allowed, eps=1e-12):
     kernel_sum = kernel.sum()
 
     if kernel_sum > eps:
-        return kernel / kernel_sum, "kernel"
+        return kernel / kernel_sum
 
-    if allowed.sum() > 0:
-        return np.zeros_like(kernel), "zero_denominator"
+    return np.zeros_like(kernel)
 
-    return np.zeros_like(kernel), "zero_support"
+
+def group_sum(obj, level, axis=0, sort=True):
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=".*axis.*deprecated.*",
+            category=FutureWarning,
+        )
+        return obj.groupby(level=level, axis=axis, sort=sort).sum()
 
 
 ## Restore multi-index labels
