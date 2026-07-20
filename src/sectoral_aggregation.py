@@ -3,6 +3,7 @@
 import numpy as np
 import pandas as pd
 
+
 def sectoral_aggregation(
     Z, M,
     VA,
@@ -35,7 +36,7 @@ def sectoral_aggregation(
 
     full_agg = np.kron(np.eye(n_provinces), sector_agg)
 
-    ## Index and matrix aggregation    
+    ## Index and matrix aggregation
     idx_agg = pd.MultiIndex.from_product(
         [provinces, sector_ids_76],
         names=["Province", "Sector"],

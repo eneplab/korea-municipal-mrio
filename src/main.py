@@ -1,7 +1,6 @@
 # src/main.py
 
 from pathlib import Path
-import warnings
 
 import pandas as pd
 
@@ -14,23 +13,25 @@ from src.mrio_io import save_mrio
 from src.mrio_preprocessing import mrio_preprocessing
 from src.mrgras_balancing import multi_regional_gras
 from src.municipal_disaggregation import municipal_disaggregation
-from src.utils import build_zero_set, municipality_name_to_id, restore_io_labels, split_signed
-
-
-warnings.filterwarnings("ignore")
+from src.utils import (
+    build_activity_sets,
+    municipality_name_to_id,
+    restore_io_labels,
+    split_signed,
+)
 
 SECTOR_NAME_TO_ID_76 = {name: sector_id for sector_id, name in SECTOR_76.items()}
 
 
-def load_distance(DATA, distance_name):
+def load_distance(data_dir, distance_name):
 
     distance_17 = pd.read_csv(
-        DATA / f"{distance_name}_17.csv",
+        data_dir / f"{distance_name}_17.csv",
         index_col=0,
     )
 
     distance_229 = pd.read_csv(
-        DATA / f"{distance_name}_229.csv",
+        data_dir / f"{distance_name}_229.csv",
         header=[0, 1],
         index_col=[0, 1],
     )
@@ -132,29 +133,20 @@ def run_pipeline(
     distance_name="travel_time",
     final_demand_proxy="component",
     out_dir=None,
-    diagnostics_dir=None,
     save_outputs=True,
-    save_diagnostics=True,
-    save_allocation_report=True,
-    return_allocation_report=True,
     verbose=True,
 ):
 
-    ROOT = Path(__file__).resolve().parents[1]
-    DATA = ROOT / "data"
+    root = Path(__file__).resolve().parents[1]
+    data_dir = root / "data"
 
     if out_dir is None:
-        out_dir = ROOT / "release" / "baseline"
-    if diagnostics_dir is None:
-        diagnostics_dir = ROOT / "release" / "diagnostics"
+        out_dir = root / "release"
 
     out_dir = Path(out_dir)
-    diagnostics_dir = Path(diagnostics_dir)
 
     if save_outputs:
         out_dir.mkdir(parents=True, exist_ok=True)
-    if save_diagnostics:
-        diagnostics_dir.mkdir(parents=True, exist_ok=True)
 
     ## MRIO preprocessing
     (
@@ -168,7 +160,7 @@ def run_pipeline(
         x_i,
         x_m,
     ) = mrio_preprocessing(
-        benchmark_path=DATA / "benchmark_io.csv",
+        benchmark_path=data_dir / "benchmark_io.csv",
         SECTOR_83=SECTOR_83,
         SECTOR_MAPPING_83_TO_76=SECTOR_MAPPING_83_TO_76,
     )
@@ -177,13 +169,12 @@ def run_pipeline(
         print("[DONE] MRIO preprocessing completed")
 
     ## Load municipal data
-    grdp = pd.read_csv(DATA / "regional_grdp.csv")
-    population = pd.read_csv(DATA / "population_229.csv")
-    employment = pd.read_csv(DATA / "employment_229.csv")
-    expenditure = pd.read_csv(DATA / "local_government_expenditure_229.csv")
-    zero = pd.read_csv(DATA / "zero_employee.csv")
+    grdp = pd.read_csv(data_dir / "municipal_grdp.csv")
+    population = pd.read_csv(data_dir / "population_229.csv")
+    expenditure = pd.read_csv(data_dir / "municipal_expenditure.csv")
+    zero = pd.read_csv(data_dir / "zero_employee.csv")
 
-    zero_set, exception_set = build_zero_set(
+    inactive, exceptions = build_activity_sets(
         zero=zero,
         SECTOR_NAME_TO_ID_76=SECTOR_NAME_TO_ID_76,
         MUNICIPALITIES_229=MUNICIPALITIES_229,
@@ -217,10 +208,9 @@ def run_pipeline(
             municipalities_229=MUNICIPALITIES_229,
             grdp=grdp,
             population=population,
-            employment=employment,
             expenditure=expenditure,
-            zero_set=zero_set,
-            exception_set=exception_set,
+            inactive=inactive,
+            exceptions=exceptions,
             final_demand_proxy=final_demand_proxy,
         )
     )
@@ -230,7 +220,7 @@ def run_pipeline(
 
     ## Distance matrices
     distance_17, distance_229 = load_distance(
-        DATA=DATA,
+        data_dir=data_dir,
         distance_name=distance_name,
     )
 
@@ -238,53 +228,28 @@ def run_pipeline(
         print(f"[DONE] {distance_name} matrices loaded")
 
     ## Gravity parameters
-    gravity, denominator_zero = estimate_gravity(
+    gravity = estimate_gravity(
         Z_ref=Z_ref,
         distance_17=distance_17,
     )
-
-    if save_diagnostics:
-        gravity.to_csv(
-            diagnostics_dir / "gravity_coefficients.csv",
-            index=False,
-            encoding="utf-8-sig",
-        )
-        denominator_zero.to_csv(
-            diagnostics_dir / "gravity_denominator_zero_cases.csv",
-            index=False,
-            encoding="utf-8-sig",
-        )
 
     if verbose:
         print("[DONE] Gravity parameter estimation completed")
 
     ## Positive and negative component handling
-    _, Z_seed_neg = split_signed(Z_seed)
+    _, Z_neg = split_signed(Z_seed)
 
-    Z_pos, gravity_table, allocation_report, allocation_summary = build_positive_seed(
+    Z_pos = build_positive_seed(
         Z_seed=Z_seed,
         x_i_seed=x_i,
         distance_229=distance_229,
         gravity=gravity,
-        zero_set=zero_set,
-        exception_set=exception_set,
+        inactive=inactive,
+        exceptions=exceptions,
         delta=delta,
     )
 
-    Z0 = Z_pos + Z_seed_neg
-
-    if save_diagnostics:
-        if save_allocation_report:
-            allocation_report.to_csv(
-                diagnostics_dir / "positive_allocation_report.csv",
-                index=False,
-                encoding="utf-8-sig",
-            )
-        pd.DataFrame([allocation_summary]).to_csv(
-            diagnostics_dir / "positive_allocation_summary.csv",
-            index=False,
-            encoding="utf-8-sig",
-        )
+    Z0 = Z_pos - Z_neg
 
     if verbose:
         print("[DONE] Positive and signed baseline seeds completed")
@@ -311,13 +276,6 @@ def run_pipeline(
         x_j=x_j,
         x_m=x_m,
     )
-
-    if save_diagnostics:
-        pd.DataFrame([info]).to_csv(
-            diagnostics_dir / "mrgras_convergence.csv",
-            index=False,
-            encoding="utf-8-sig",
-        )
 
     if verbose:
         print("[DONE] Multi-regional balancing completed")
@@ -347,19 +305,14 @@ def run_pipeline(
         "x_j": x_j,
         "x_m": x_m,
         "gravity": gravity,
-        "denominator_zero": denominator_zero,
-        "allocation_summary": allocation_summary,
         "mrgras_info": info,
         "delta": delta,
         "distance_name": distance_name,
     }
 
-    if return_allocation_report:
-        outputs["allocation_report"] = allocation_report
-
     ## Save outputs
     if save_outputs:
-        matrices, MRIO, manifest = save_mrio(
+        MRIO, manifest = save_mrio(
             out_dir=out_dir,
             Z=Z,
             M=M,
@@ -370,14 +323,20 @@ def run_pipeline(
             x_j=x_j,
             x_m=x_m,
             info=info,
+            municipality_map=MUNICIPALITIES_229,
+            sector_map=SECTOR_76,
+            config={
+                "delta": delta,
+                "distance_measure": distance_name,
+                "final_demand_proxy": final_demand_proxy,
+            },
         )
 
-        outputs["matrices"] = matrices
         outputs["MRIO"] = MRIO
         outputs["manifest"] = manifest
 
         if verbose:
-            print("[DONE] Baseline MRIO outputs saved")
+            print("[DONE] Municipal MRIO output saved")
 
     return outputs
 

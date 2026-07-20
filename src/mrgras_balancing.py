@@ -1,11 +1,12 @@
 # src/mrgras_balancing.py
 
+import time
+
 import numpy as np
 import pandas as pd
-import time
-import warnings
 
-warnings.filterwarnings("ignore")
+from src.utils import group_sum
+
 
 def multi_regional_gras(
     Z,
@@ -14,7 +15,7 @@ def multi_regional_gras(
     VA,
     Y_d,
     Y_m,
-    x_i,             
+    x_i,
     x_j,
     x_m,
     mult_tol=1e-6,
@@ -41,8 +42,10 @@ def multi_regional_gras(
     x_i_safe = x_i.reindex(Z.index).fillna(0).iloc[:, 0].abs()
     x_i_safe[x_i_safe < 1e-6] = 1.0
 
-    row_negligible_mask = (np.abs(row_target_init) < 1e-3) & \
-                   ((np.abs(row_target_init) / x_i_safe) < 1e-7)
+    row_negligible_mask = (
+        (np.abs(row_target_init) < 1e-3)
+        & ((np.abs(row_target_init) / x_i_safe) < 1e-7)
+    )
 
     row_target = row_target_init.copy()
     row_target[row_negligible_mask] = 0.0
@@ -50,8 +53,10 @@ def multi_regional_gras(
     x_j_safe = x_j.reindex(Z.columns, axis=1).fillna(0).iloc[0, :].abs()
     x_j_safe[x_j_safe < 1e-6] = 1.0
 
-    col_negligible_mask = (np.abs(col_target_init) < 1e-3) & \
-                   ((np.abs(col_target_init) / x_j_safe) < 1e-7)
+    col_negligible_mask = (
+        (np.abs(col_target_init) < 1e-3)
+        & ((np.abs(col_target_init) / x_j_safe) < 1e-7)
+    )
 
     col_target = col_target_init.copy()
     col_target[col_negligible_mask] = 0.0
@@ -73,12 +78,10 @@ def multi_regional_gras(
 
     ## Block targets
     if isinstance(Z_block.index, pd.MultiIndex):
-        Z_block_province = (
-            Z_block
-            .groupby(level=0, axis=0)
-            .sum()
-            .groupby(level=0, axis=1)
-            .sum()
+        Z_block_province = group_sum(
+            group_sum(Z_block, level=0, axis=0),
+            level=0,
+            axis=1,
         )
     else:
         Z_block_province = Z_block.copy()
@@ -100,6 +103,9 @@ def multi_regional_gras(
     block_target = Z_block_province.to_numpy(dtype=float)
     block_constraint_mask = ~np.isnan(block_target)
 
+    row_positions = [np.flatnonzero(block_R == k) for k in range(n_provinces)]
+    col_positions = [np.flatnonzero(block_S == k) for k in range(n_provinces)]
+
     ## Multiplier initialization
     rho = np.ones(n_rows)
     sigma = np.ones(n_cols)
@@ -115,7 +121,9 @@ def multi_regional_gras(
 
         idx_std = mask_p & mask_pos_target
         if np.any(idx_std):
-            new_mult[idx_std] = (target[idx_std] + discriminant[idx_std]) / (2 * p_term[idx_std])
+            new_mult[idx_std] = (
+                target[idx_std] + discriminant[idx_std]
+            ) / (2 * p_term[idx_std])
 
         idx_rat = mask_p & (~mask_pos_target)
         if np.any(idx_rat):
@@ -128,7 +136,69 @@ def multi_regional_gras(
 
         return np.nan_to_num(new_mult, nan=1.0)
 
+    def constraint_residuals(rho, sigma, tau):
+        row_estimated = np.zeros(n_rows)
+        col_estimated = np.zeros(n_cols)
+        block_estimated = np.zeros_like(block_target)
+
+        for R, rows in enumerate(row_positions):
+            for S, cols in enumerate(col_positions):
+                ix = np.ix_(rows, cols)
+                scale = rho[rows, None] * sigma[None, cols] * tau[R, S]
+                values = (
+                    Z_pos[ix] * scale
+                    - Z_neg[ix] / np.maximum(scale, 1e-100)
+                )
+                row_estimated[rows] += values.sum(axis=1)
+                col_estimated[cols] += values.sum(axis=0)
+                block_estimated[R, S] = values.sum()
+
+        return residual_summary(row_estimated, col_estimated, block_estimated)
+
+    def residual_summary(row_estimated, col_estimated, block_estimated):
+        def residual(estimated, target, mask):
+            error = np.abs(estimated[mask] - target[mask])
+            scale = np.maximum(np.abs(target[mask]), 1.0)
+            zero = np.abs(target[mask]) <= eps
+            return (
+                float(error.max(initial=0.0)),
+                float((error / scale).max(initial=0.0)),
+                float(error[zero].max(initial=0.0)),
+            )
+
+        row_abs, row_scaled, row_zero = residual(row_estimated, u, valid_rows)
+        col_abs, col_scaled, col_zero = residual(col_estimated, v, valid_cols)
+        block_abs, block_scaled, block_zero = residual(
+            block_estimated,
+            block_target,
+            block_constraint_mask,
+        )
+
+        return {
+            "row_residual": row_abs,
+            "column_residual": col_abs,
+            "block_residual": block_abs,
+            "max_absolute_residual": max(row_abs, col_abs, block_abs),
+            "max_scaled_residual": max(row_scaled, col_scaled, block_scaled),
+            "zero_target_residual": max(row_zero, col_zero, block_zero),
+        }
+
+    def matrix_residuals(values):
+        row_estimated = np.zeros(n_rows)
+        col_estimated = np.zeros(n_cols)
+        block_estimated = np.zeros_like(block_target)
+
+        for R, rows in enumerate(row_positions):
+            for S, cols in enumerate(col_positions):
+                block = values[np.ix_(rows, cols)]
+                row_estimated[rows] += block.sum(axis=1)
+                col_estimated[cols] += block.sum(axis=0)
+                block_estimated[R, S] = block.sum()
+
+        return residual_summary(row_estimated, col_estimated, block_estimated)
+
     ## Iterative balancing
+    converged = False
     for n_iter in range(1, max_iter + 1):
         rho_prev, sigma_prev, tau_prev = rho.copy(), sigma.copy(), tau.copy()
 
@@ -138,19 +208,21 @@ def multi_regional_gras(
         rho_tau = rho[:, None] * tau_block
         pos_col_sum = (Z_pos * rho_tau).sum(axis=0)
         neg_col_sum = (Z_neg / (rho_tau + 1e-100)).sum(axis=0)
-        sigma[valid_cols] = update_multiplier(v[valid_cols], pos_col_sum[valid_cols], neg_col_sum[valid_cols])
-
-        col_estimated = sigma * pos_col_sum - (neg_col_sum / (sigma + 1e-100))
-        col_residual = np.max(np.abs(col_estimated[valid_cols] - v[valid_cols]))
+        sigma[valid_cols] = update_multiplier(
+            v[valid_cols],
+            pos_col_sum[valid_cols],
+            neg_col_sum[valid_cols],
+        )
 
         # Row update (rho)
         sigma_tau = sigma[None, :] * tau_block
         pos_row_sum = (Z_pos * sigma_tau).sum(axis=1)
         neg_row_sum = (Z_neg / (sigma_tau + 1e-100)).sum(axis=1)
-        rho[valid_rows] = update_multiplier(u[valid_rows], pos_row_sum[valid_rows], neg_row_sum[valid_rows])
-
-        row_estimated = rho * pos_row_sum - (neg_row_sum / (rho + 1e-100))
-        row_residual = np.max(np.abs(row_estimated[valid_rows] - u[valid_rows]))
+        rho[valid_rows] = update_multiplier(
+            u[valid_rows],
+            pos_row_sum[valid_rows],
+            neg_row_sum[valid_rows],
+        )
 
         # Block update (tau)
         rho_sigma = rho[:, None] * sigma[None, :]
@@ -162,35 +234,59 @@ def multi_regional_gras(
 
         for i in range(n_rows):
             province_row = block_R[i]
-            block_pos[province_row, :] += np.bincount(block_S, weights=pos_scaled[i, :], minlength=n_provinces)
-            block_neg[province_row, :] += np.bincount(block_S, weights=neg_scaled[i, :], minlength=n_provinces)
+            block_pos[province_row, :] += np.bincount(
+                block_S,
+                weights=pos_scaled[i, :],
+                minlength=n_provinces,
+            )
+            block_neg[province_row, :] += np.bincount(
+                block_S,
+                weights=neg_scaled[i, :],
+                minlength=n_provinces,
+            )
 
-        block_update_mask = block_constraint_mask & ((block_pos > eps) | (block_neg > eps))
+        block_update_mask = block_constraint_mask & (
+            (block_pos > eps) | (block_neg > eps)
+        )
         if np.any(block_update_mask):
             tau[block_update_mask] = update_multiplier(
                 block_target[block_update_mask],
                 block_pos[block_update_mask],
-                block_neg[block_update_mask]
+                block_neg[block_update_mask],
             )
-
-        block_estimated = tau * block_pos - (block_neg / (tau + 1e-100))
-        block_residual = np.max(np.abs(block_estimated[block_constraint_mask] - block_target[block_constraint_mask]))
 
         mult_diff = max(
             np.abs(rho - rho_prev).max(),
             np.abs(sigma - sigma_prev).max(),
-            np.abs(tau - tau_prev).max()
+            np.abs(tau - tau_prev).max(),
         )
-        max_residual = max(row_residual, col_residual, block_residual)
+        residuals = None
+        if mult_diff < mult_tol:
+            residuals = constraint_residuals(rho, sigma, tau)
+            constraints_met = (
+                residuals["max_scaled_residual"] < constraint_tol
+                and residuals["zero_target_residual"] < constraint_tol
+            )
+            if constraints_met:
+                converged = True
+                print(
+                    f"[DONE] Converged at iteration {n_iter} | "
+                    f"Scaled resid: {residuals['max_scaled_residual']:.1e} | "
+                    f"Zero-target resid: {residuals['zero_target_residual']:.1e}"
+                )
+                break
 
         if n_iter % print_iter == 0 or n_iter == 1:
-            print(f"[Iter {n_iter:6d}] Diff: {mult_diff:.1e} | "
-                  f"Resid: {max_residual:.1e} "
-                  f"(R:{row_residual:.1e}, C:{col_residual:.1e}, B:{block_residual:.1e})")
+            print(f"[Iter {n_iter:6d}] Diff: {mult_diff:.1e}")
 
-        if mult_diff < mult_tol and max_residual < constraint_tol:
-            print(f"[DONE] Converged at iteration {n_iter}")
-            break
+    if not converged:
+        residuals = constraint_residuals(rho, sigma, tau)
+        raise RuntimeError(
+            f"MR-GRAS did not converge after {max_iter} iterations: "
+            f"multiplier change={mult_diff:.3e}, "
+            f"scaled residual={residuals['max_scaled_residual']:.3e}, "
+            f"zero-target residual={residuals['zero_target_residual']:.3e}"
+        )
 
     ## Final balanced matrix
     tau_block = tau[block_R[:, None], block_S[None, :]]
@@ -198,25 +294,48 @@ def multi_regional_gras(
 
     Z_pos_final = Z_pos * scaling_factor
     Z_neg_final = np.zeros_like(Z_neg)
-    np.divide(Z_neg, scaling_factor, out=Z_neg_final, where=(scaling_factor > 1e-100))
+    np.divide(
+        Z_neg,
+        scaling_factor,
+        out=Z_neg_final,
+        where=(scaling_factor > 1e-100),
+    )
 
     Z_balanced = Z_pos_final - Z_neg_final
     Z = pd.DataFrame(Z_balanced, index=Z.index, columns=Z.columns)
 
+    final_residuals = matrix_residuals(Z_balanced)
+    if (
+        final_residuals["max_scaled_residual"] >= constraint_tol
+        or final_residuals["zero_target_residual"] >= constraint_tol
+    ):
+        raise RuntimeError(
+            "Final MR-GRAS matrix failed the independent constraint check: "
+            f"scaled residual={final_residuals['max_scaled_residual']:.3e}, "
+            f"zero-target residual={final_residuals['zero_target_residual']:.3e}"
+        )
+
     score_r = np.mean(np.abs(np.log(rho + 1e-20)))
     score_s = np.mean(np.abs(np.log(sigma + 1e-20)))
     score_t = np.mean(np.abs(np.log(tau + 1e-20)))
-    
     total_distortion = score_r + score_s + score_t
 
     info = {
         "iterations": n_iter,
-        "final_residual": float(max_residual),
-        "score_total": float(total_distortion), 
+        "converged": converged,
+        "multiplier_tolerance": mult_tol,
+        "constraint_tolerance": constraint_tol,
+        "final_residual": final_residuals["max_absolute_residual"],
+        "max_scaled_residual": final_residuals["max_scaled_residual"],
+        "zero_target_residual": final_residuals["zero_target_residual"],
+        "row_residual": final_residuals["row_residual"],
+        "column_residual": final_residuals["column_residual"],
+        "block_residual": final_residuals["block_residual"],
+        "max_multiplier_change": float(mult_diff),
+        "score_total": float(total_distortion),
         "score_r": float(score_r),
         "score_s": float(score_s),
         "score_t": float(score_t),
-        
         "time_sec": time.time() - t0,
     }
 
