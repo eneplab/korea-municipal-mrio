@@ -1,9 +1,11 @@
 # src/utils.py
 
+import math
 import warnings
 
 import numpy as np
 import pandas as pd
+from pathlib import Path
 
 
 ## Convert distance matrix index from names to municipality IDs
@@ -65,48 +67,37 @@ def add_municipality_id(data, MUNICIPALITIES_229):
     return data
 
 
-## Build production activity condition sets
-def build_activity_sets(zero, SECTOR_NAME_TO_ID_76, MUNICIPALITIES_229):
-
-    zero = zero.copy()
-    for column in ("Province", "Municipality", "Sector"):
-        zero[column] = zero[column].astype(str).str.strip()
-
-    zero = add_municipality_id(zero, MUNICIPALITIES_229)
-    zero["sector"] = zero["Sector"].map(SECTOR_NAME_TO_ID_76)
-    zero = zero.dropna(subset=["sector"]).copy()
-    zero["sector"] = zero["sector"].astype(int)
-
-    inactive = set(zip(zero["Province"], zero["ID"], zero["sector"]))
-    exceptions = {("Sejong", 72, SECTOR_NAME_TO_ID_76["Ships"])}
-
-    return inactive, exceptions
-
-
 def is_inactive(p, m, sector, inactive, exceptions):
 
     return (p, m, sector) in inactive and (p, m, sector) not in exceptions
 
 
-## Signed component split
-def split_signed(Z):
+def stable_sum(values, axis):
 
-    Z_pos = Z.clip(lower=0)
-    Z_neg = (-Z).clip(lower=0)
+    values = np.asarray(values, dtype=float)
+    if not np.isfinite(values).all():
+        raise ValueError("Accounting values must be finite")
+    if axis == 0:
+        values = values.T
 
-    return Z_pos, Z_neg
+    return np.array([math.fsum(row) for row in values])
 
 
-## Kernel normalization
-def normalize_kernel(kernel, allowed, eps=1e-12):
+def allocate_array(shape, work_dir=None, name="matrix"):
+    if work_dir is None:
+        return np.zeros(shape, dtype=float)
 
-    kernel = np.where(allowed, kernel, 0.0)
-    kernel_sum = kernel.sum()
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    values = np.lib.format.open_memmap(
+        work_dir / (name + ".npy"),
+        mode="w+",
+        dtype=float,
+        shape=shape,
+    )
+    values[:] = 0.0
 
-    if kernel_sum > eps:
-        return kernel / kernel_sum
-
-    return np.zeros_like(kernel)
+    return values
 
 
 def group_sum(obj, level, axis=0, sort=True):
@@ -206,8 +197,12 @@ def restore_io_labels(
         if is_import:
             df.index = build_import_index()
 
-        elif len(df.index) == 1:
-            df.index = build_account_index(obj.index[0])
+        elif len(df.index) == 1 or obj.index.names[0] == "Account":
+            labels = [label[-1] if isinstance(label, tuple) else label for label in obj.index]
+            df.index = pd.MultiIndex.from_arrays(
+                [["Account"] * len(labels), [""] * len(labels), [safe(label) for label in labels]],
+                names=["Province", "Municipality", "Sector"],
+            )
 
         else:
             df.index = build_io_index()

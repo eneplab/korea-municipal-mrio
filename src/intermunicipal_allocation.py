@@ -2,10 +2,9 @@
 
 import numpy as np
 import pandas as pd
-from scipy import stats
 
 from src.intramunicipal_allocation import calculate_flq_intra
-from src.utils import group_sum, is_inactive, normalize_kernel
+from src.utils import allocate_array, group_sum, is_inactive
 
 
 EPS = 1e-12
@@ -16,66 +15,22 @@ def fit_log_ols(obs, variable_names):
     if len(obs) == 0:
         return None
 
-    obs = pd.DataFrame(
-        obs,
-        columns=["log_T"] + variable_names,
-    )
-
+    obs = pd.DataFrame(obs, columns=["log_T"] + variable_names)
     y = obs["log_T"].values.astype(float)
     X_raw = obs[variable_names].values.astype(float)
     X = np.column_stack([np.ones(len(obs)), X_raw])
 
     n_obs = len(obs)
     n_params = X.shape[1]
-
     if n_obs <= n_params:
         return None
 
     beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
-
-    y_hat = X @ beta
-    resid = y - y_hat
-
-    rss = float(np.sum(resid ** 2))
-    tss = float(np.sum((y - y.mean()) ** 2))
-
-    r2 = 1.0 - rss / tss if tss > EPS else np.nan
-    adj_r2 = (
-        1.0 - (1.0 - r2) * (n_obs - 1) / (n_obs - n_params)
-        if n_obs > n_params
-        else np.nan
-    )
-
-    sigma2 = rss / (n_obs - n_params)
-
-    try:
-        xtx_inv = np.linalg.inv(X.T @ X)
-        se = np.sqrt(np.diag(xtx_inv) * sigma2)
-    except np.linalg.LinAlgError:
-        se = np.full(n_params, np.nan)
-
-    t_stat = np.divide(
-        beta,
-        se,
-        out=np.full_like(beta, np.nan),
-        where=se > EPS,
-    )
-
-    p_value = 2.0 * stats.t.sf(np.abs(t_stat), df=n_obs - n_params)
-
-    result = {
-        "n_obs": n_obs,
-        "r2": r2,
-        "adj_r2": adj_r2,
-        "rss": rss,
-    }
-
+    result = {"n_obs": n_obs}
     names = ["const"] + variable_names
+
     for idx, name in enumerate(names):
         result[f"{name}_coef"] = beta[idx]
-        result[f"{name}_se"] = se[idx]
-        result[f"{name}_t"] = t_stat[idx]
-        result[f"{name}_p"] = p_value[idx]
 
     return result
 
@@ -100,8 +55,6 @@ def estimate_gravity(Z_ref, distance_17):
         destination = trade_flows.sum(axis=0)
 
         obs = []
-        positive_flow_count = 0
-        denominator_zero_count = 0
 
         for R in provinces:
             for S in provinces:
@@ -119,10 +72,7 @@ def estimate_gravity(Z_ref, distance_17):
                 if T_RS <= 0:
                     continue
 
-                positive_flow_count += 1
-
                 if O_R <= 0 or D_S <= 0 or dist <= 0:
-                    denominator_zero_count += 1
                     continue
 
                 obs.append(
@@ -139,11 +89,7 @@ def estimate_gravity(Z_ref, distance_17):
             ["log_origin", "log_destination", "log_distance"],
         )
 
-        row = {
-            "input_sector": i,
-            "positive_flow_count": positive_flow_count,
-            "denominator_zero_count": denominator_zero_count,
-        }
+        row = {"input_sector": i}
 
         if result is None:
             row.update(
@@ -176,6 +122,7 @@ def build_positive_seed(
     inactive,
     exceptions,
     delta=0.30,
+    work_dir=None,
 ):
 
     ## Index preparation
@@ -206,7 +153,10 @@ def build_positive_seed(
     }
 
     ## Positive origin mass
-    origin_mass = Z_seed.clip(lower=0).sum(axis=1).values
+    origin_mass = np.zeros(len(Z_seed))
+    for start in range(0, len(Z_seed), 256):
+        values = Z_seed.iloc[start:start + 256, :].to_numpy()
+        origin_mass[start:start + len(values)] = np.maximum(values, 0).sum(axis=1)
 
     ## Commodity-level destination mass
     destination_mass = pd.DataFrame(
@@ -235,8 +185,20 @@ def build_positive_seed(
         x_i_seed=x_i_seed,
         delta=delta,
     )
+    local_activity = np.array([
+        not is_inactive(p, r, i, inactive, exceptions)
+        and not is_inactive(p, r, j, inactive, exceptions)
+        for p, r, i, j in flq_ijr[
+            ["Province", "Municipality", "input_sector", "purchasing_sector"]
+        ].itertuples(index=False, name=None)
+    ])
+    flq_ijr.loc[~local_activity, "Z_rr_FLQ_pos"] = 0.0
+    flq_sum = flq_ijr.groupby(
+        ["Province", "input_sector", "purchasing_sector"], sort=False
+    )["Z_rr_FLQ_pos"].sum()
 
-    Z_pos_new = np.zeros(Z_seed.shape, dtype=float)
+    Z_pos_new = allocate_array(Z_seed.shape, work_dir, "positive_allocation")
+    unallocated = []
 
     for (R, r), grp in flq_ijr.groupby(["Province", "Municipality"], sort=False):
 
@@ -287,12 +249,7 @@ def build_positive_seed(
                 )
                 .sum(axis=(1, 3))
             )
-
-            target = pd.DataFrame(
-                target_values,
-                index=sectors,
-                columns=sectors,
-            )
+            benchmark_values = target_values.copy()
 
             if R == S:
                 flq_block = (
@@ -302,15 +259,21 @@ def build_positive_seed(
                     .reindex(index=sectors, columns=sectors)
                     .fillna(0.0)
                 )
-                target = (target - flq_block).clip(lower=0.0)
+                target_values = np.maximum(target_values - flq_block.to_numpy(), 0.0)
 
             time_block = distance_values.loc[
                 R_municipalities,
                 S_municipalities,
             ].values.astype(float)
-            time_block = np.where(time_block <= 0, 1e-9, time_block)
+            if R == S:
+                offdiagonal = ~np.eye(len(R_municipalities), dtype=bool)
+            else:
+                offdiagonal = np.ones(time_block.shape, dtype=bool)
+            if not np.isfinite(time_block).all() or (time_block[offdiagonal] <= 0).any():
+                raise ValueError("Distance matrix has invalid off-diagonal values")
+            time_block = np.where(time_block <= 0, 1.0, time_block)
 
-            for i in sectors:
+            for idx_i, i in enumerate(sectors):
 
                 params = gravity_map.get(i, {})
                 method = params.get("method", "simple_trade")
@@ -337,22 +300,22 @@ def build_positive_seed(
                     dtype=bool,
                 )
 
-                if method == "gravity":
-                    base_kernel = (
-                        (O_vec[:, None] ** alpha)
-                        * (D_vec[None, :] ** beta)
-                        / (time_block ** gamma)
-                    )
-                else:
-                    base_kernel = O_vec[:, None] * D_vec[None, :]
+                positive_mass = (O_vec[:, None] > 0) & (D_vec[None, :] > 0)
+                log_origin = np.log(np.maximum(O_vec, np.finfo(float).tiny))
+                log_destination = np.log(np.maximum(D_vec, np.finfo(float).tiny))
+                if method != "gravity":
+                    alpha, beta, gamma = 1.0, 1.0, 0.0
+                log_kernel = (
+                    alpha * log_origin[:, None]
+                    + beta * log_destination[None, :]
+                    - gamma * np.log(time_block)
+                )
 
-                if R == S:
-                    np.fill_diagonal(base_kernel, 0.0)
+                for idx_j, j in enumerate(sectors):
 
-                for j in sectors:
-
-                    value = float(target.loc[i, j])
-                    if value <= EPS:
+                    value = float(target_values[idx_i, idx_j])
+                    benchmark_value = float(benchmark_values[idx_i, idx_j])
+                    if benchmark_value <= EPS:
                         continue
 
                     col_pos_j = positions[(S, j)]
@@ -365,24 +328,76 @@ def build_positive_seed(
                         dtype=bool,
                     )
 
-                    allowed = active_origin[:, None] & active_destination[None, :]
+                    allowed = active_origin[:, None] & active_destination[None, :] & positive_mass
 
                     if R == S:
+                        local_allowed = np.diag(allowed).copy()
                         np.fill_diagonal(allowed, False)
+                        if not allowed.any() and not local_allowed.any():
+                            Z_pos_new[np.ix_(row_pos_i, col_pos_j)] = 0.0
+                            unallocated.append((R, S, i, j))
+                            continue
+                        if not allowed.any() and local_allowed.any():
+                            # No cross-municipal support: conserve over admissible local pairs.
+                            old_local = Z_pos_new[row_pos_i, col_pos_j].copy()
+                            prior = np.where(local_allowed, old_local, 0.0)
+                            if prior.sum() <= 0:
+                                signed_seed_block = Z_seed.iloc[row_pos_i, col_pos_j].to_numpy()
+                                prior = np.where(
+                                    local_allowed,
+                                    np.maximum(np.diag(signed_seed_block), 0),
+                                    0.0,
+                                )
+                            if prior.sum() <= 0:
+                                raise ValueError("Admissible local pairs lack a positive allocation prior")
+                            local_values = benchmark_value * prior / prior.sum()
+                            Z_pos_new[np.ix_(row_pos_i, col_pos_j)] = np.diag(local_values)
+                            continue
 
-                    weights = normalize_kernel(
-                        kernel=base_kernel,
-                        allowed=allowed,
-                    )
+                    if value <= EPS:
+                        continue
 
-                    if weights.sum() > EPS:
+                    if allowed.any():
+                        weights = np.zeros(log_kernel.shape)
+                        shifted = log_kernel[allowed] - log_kernel[allowed].max()
+                        weights[allowed] = np.exp(shifted)
+                        weights /= weights.sum()
                         allocated_value = value * weights
                         Z_pos_new[np.ix_(row_pos_i, col_pos_j)] += allocated_value
+                    else:
+                        unallocated.append((R, S, i, j))
 
     Z_pos = pd.DataFrame(
         Z_pos_new,
         index=Z_seed.index,
         columns=Z_seed.columns,
+        copy=False,
     )
+    if unallocated:
+        raise ValueError(
+            "Positive benchmark transactions have no municipal allocation pair: "
+            + str(unallocated[:3])
+        )
+
+    ## Provincial transaction conservation
+    block_checks = []
+    for R in provinces:
+        rows = np.concatenate([positions[(R, i)] for i in sectors])
+        for S in provinces:
+            cols = np.concatenate([positions[(S, j)] for j in sectors])
+            shape = (
+                len(sectors), len(municipalities_by_province[R]),
+                len(sectors), len(municipalities_by_province[S]),
+            )
+            expected = (
+                np.maximum(Z_seed.iloc[rows, cols].to_numpy(), 0)
+                .reshape(shape).sum(axis=(1, 3))
+            )
+            estimated = Z_pos_new[np.ix_(rows, cols)].reshape(shape).sum(axis=(1, 3))
+            error = np.abs(estimated - expected)
+            scaled = error / np.maximum(np.abs(expected), 1.0)
+            block_checks.append(float(scaled.max()))
+    if max(block_checks) >= 1e-10:
+        raise ValueError("Positive allocation failed provincial sector-pair conservation")
 
     return Z_pos

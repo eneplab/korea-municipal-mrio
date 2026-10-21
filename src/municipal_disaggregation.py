@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 
-from src.utils import add_municipality_id
+from src.utils import add_municipality_id, allocate_array
 
 
 def municipal_disaggregation(data):
@@ -25,9 +25,11 @@ def municipal_disaggregation(data):
     grdp = data["grdp"]
     population = data["population"]
     expenditure = data["expenditure"]
-    inactive = data.get("inactive", set())
-    exceptions = data.get("exceptions", set())
-    final_demand_proxy = data.get("final_demand_proxy", "component")
+    allocation = data["allocation"].set_index(
+        ["province_en", "municipality_id", "io"]
+    )
+    value_added_weight = "output_weight"
+    work_dir = data.get("work_dir")
 
     ## Dimensions
     provinces = Z.index.get_level_values("Province").unique().tolist()
@@ -55,16 +57,16 @@ def municipal_disaggregation(data):
     population = add_municipality_id(population, municipalities_229)
     expenditure = add_municipality_id(expenditure, municipalities_229)
 
-    grdp["GRDP"] = pd.to_numeric(grdp["GRDP"], errors="coerce").fillna(0.0)
+    grdp["GRDP"] = pd.to_numeric(grdp["GRDP"], errors="raise")
     population["Population"] = pd.to_numeric(
-        population["Population"], errors="coerce"
-    ).fillna(0.0)
+        population["Population"], errors="raise"
+    )
     expenditure["general_account_expenditure"] = pd.to_numeric(
-        expenditure["general_account_expenditure"], errors="coerce"
-    ).fillna(0.0)
+        expenditure["general_account_expenditure"], errors="raise"
+    )
     expenditure["special_account_expenditure"] = pd.to_numeric(
-        expenditure["special_account_expenditure"], errors="coerce"
-    ).fillna(0.0)
+        expenditure["special_account_expenditure"], errors="raise"
+    )
 
     grdp_map = {
         p: grdp.loc[grdp["Province"] == p].set_index("ID")["GRDP"]
@@ -85,21 +87,17 @@ def municipal_disaggregation(data):
         for p in provinces
     }
 
-    def is_inactive(p, m, sector):
-        return (p, m, sector) in inactive and (p, m, sector) not in exceptions
-
     def normalized_weight(series, municipalities):
-        values = series.reindex(municipalities).fillna(0.0).astype(float)
+        values = series.reindex(municipalities).astype(float)
+        if not np.isfinite(values).all() or (values < 0).any():
+            raise ValueError("Final demand proxy contains unavailable or negative values")
         total = values.sum()
         if total > eps:
             return values.values / total
-        return np.zeros(len(municipalities))
+        raise ValueError("Final demand proxy has a zero provincial denominator")
 
     def fd_weight(p, fd):
         municipalities = region_hierarchy[p]
-
-        if final_demand_proxy == "grdp":
-            return normalized_weight(grdp_map[p], municipalities)
 
         if "Private Final Consumption" in fd:
             return normalized_weight(population_map[p], municipalities)
@@ -118,22 +116,30 @@ def municipal_disaggregation(data):
     ## Weights
     # Production accounts and intermediate transactions
     W_inter = {}
+    W_value_added = {}
     active_municipalities = {}
 
     for p in provinces:
-        g = grdp_map[p]
         municipalities = region_hierarchy[p]
 
         for sector in sectors:
-            active = [m for m in municipalities if not is_inactive(p, m, sector)]
+            weights = allocation.loc[[(p, m, sector) for m in municipalities]]
+            w_output = weights.output_weight.to_numpy(float)
+            w_value_added = weights[value_added_weight].to_numpy(float)
+            if not np.isfinite(w_output).all() or not np.isfinite(w_value_added).all():
+                raise ValueError("Allocation weights are not finite")
+            if (w_output < 0).any() or (w_value_added < 0).any():
+                raise ValueError("Allocation weights must be nonnegative")
+            for w, target in [
+                (w_output, abs(float(x_i.loc[(p, sector)].iloc[0]))),
+                (w_value_added, VA.loc[:, (p, sector)].abs().sum()),
+            ]:
+                if target > eps and not np.isclose(w.sum(), 1.0, rtol=0, atol=1e-12):
+                    raise ValueError(f"Weights do not preserve provincial account {(p, sector)}")
+            active = [m for m, w in zip(municipalities, w_output) if w > 0]
             active_municipalities[(p, sector)] = active
-
-            w = np.zeros(len(active))
-            if active:
-                grdp_total = g.reindex(active).sum()
-                if grdp_total > eps:
-                    w = g.reindex(active).values / grdp_total
-            W_inter[(p, sector)] = w
+            W_inter[(p, sector)] = w_output[w_output > 0]
+            W_value_added[(p, sector)] = w_value_added
 
     # Final demand weights are not subject to the production activity condition.
     W_fd = {
@@ -143,7 +149,7 @@ def municipal_disaggregation(data):
     }
 
     ## Domestic intermediate transactions
-    Z_temp = np.zeros((n, n))
+    Z_temp = allocate_array((n, n), work_dir, "initial_seed")
 
     for R in provinces:
         for S in provinces:
@@ -247,11 +253,17 @@ def municipal_disaggregation(data):
                 continue
             idx_P = [index_map[(p, m, sector)] for m in active_P]
 
-            VA_temp[:, idx_P] += VA.loc[:, (p, sector)].values[:, None] * w
             x_j_temp[:, idx_P] += x_j.loc[:, (p, sector)].values[:, None] * w
             x_i_temp[idx_P] += float(x_i.loc[(p, sector)].iloc[0]) * w
 
-    Z = pd.DataFrame(Z_temp, index=region_sector_index, columns=region_sector_index)
+    for p in provinces:
+        for sector in sectors:
+            idx_P = [index_map[(p, m, sector)] for m in region_hierarchy[p]]
+            VA_temp[:, idx_P] = VA.loc[:, (p, sector)].values[:, None] * W_value_added[(p, sector)]
+
+    Z = pd.DataFrame(
+        Z_temp, index=region_sector_index, columns=region_sector_index, copy=False
+    )
     M = pd.DataFrame(M_temp, index=M.index, columns=region_sector_index)
     Y_d = pd.DataFrame(Y_d_temp, index=region_sector_index, columns=fd_pair_index)
     Y_m = pd.DataFrame(Y_m_temp, index=Y_m.index, columns=fd_pair_index)

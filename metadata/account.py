@@ -13,6 +13,12 @@ FINAL_DEMAND_ITEMS = [
 
 # Value added (aggregated)
 VA_TOTAL = ["Value Added"]
+VA_COMPONENTS = [
+    "Compensation of Employees",
+    "Operating Surplus",
+    "Consumption of Fixed Capital",
+    "Net Taxes on Production",
+]
 
 # Total output and total input
 TOTAL_OUTPUT = ["Total Output"]
