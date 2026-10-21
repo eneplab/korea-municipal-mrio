@@ -13,16 +13,13 @@ release/       Generated dataset
 
 ## Inputs
 
-Public inputs are included in `data/`. The 83-sector provincial IRIO table is aggregated to 76 sectors during construction. `metadata/IO_KSIC_activity.csv` links IO sectors, KSIC Revision 10 categories, and economic activities.
-
-The number of workers is not distributed because of confidentiality restrictions. Supply `data/municipal_workers.csv` with either of the following column sets:
-
-```text
-municipality_id,ksic5,number_of_workers
-municipality_id,io,activity_id,number_of_workers
-```
-
-The file must cover all 229 municipalities and every mapped KSIC category or distinct IO-activity pair. Counts must be nonnegative and must not overlap across activities. Include confirmed zeros explicitly; do not replace suppressed or unavailable counts with zero. Municipality IDs follow `metadata/region.py`, and sector and activity IDs follow the concordance. Reproducing the published estimates requires the same prepared counts used in the study.
+- Provincial IRIO tables
+- Municipal gross output by economic activity
+- The number of workers
+- Municipal GRDP
+- Population
+- Municipal expenditure
+- Road-based travel time
 
 ## Construction
 
